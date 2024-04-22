@@ -14,11 +14,6 @@ pub(crate) fn hmac_sha256(key: &[u8], input: &[u8]) -> [u8; 32] {
     hmac.finalize().into_bytes().into()
 }
 
-//
-// Copyright 2023 Signal Messenger, LLC.
-// SPDX-License-Identifier: AGPL-3.0-only
-//
-
 use aes::cipher::{BlockDecryptMut, BlockEncryptMut};
 use std::result::Result;
 
