@@ -5,11 +5,15 @@ mod crypto;
 #[derive(Clone)]
 pub struct Chain {
     chain_key: ChainKey,
+    message_keys_list: Vec<MessageKeys>,
 }
 
 impl Chain {
     pub fn new(chain_key: ChainKey) -> Self {
-        Self { chain_key }
+        Self {
+            chain_key,
+            message_keys_list: vec![],
+        }
     }
 }
 
@@ -160,7 +164,7 @@ impl Ratchet {
     }
 
     // move the sending chain key to the next, and return the message
-    pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, crypto::EncryptionError> {
+    pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<SignalMsg, crypto::EncryptionError> {
         let chain = self.sending_key_chain.as_mut().unwrap();
         let message_keys = chain.chain_key.message_keys();
         println!("sending chain key: {:x?}", chain.chain_key);
@@ -170,24 +174,29 @@ impl Ratchet {
             &message_keys.iv,
         )?;
         chain.chain_key = chain.chain_key.next_chain_key();
-        Ok(ciphertext)
+        Ok(SignalMsg {
+            ciphertext: ciphertext,
+            idx: message_keys.index,
+        })
     }
 
-    // generate the next ratchet key pair, and create the new sending chain
+    /// generate the next ratchet key pair, and create the new sending chain
+    /// if the messages are ordered, this function will perform a ratchet DH step by
+    /// calling `get_or_create_receiver_key_chain`
     pub fn decrypt(
         &mut self,
-        ciphertext: &[u8],
+        msg: SignalMsg,
         their_ratchet_key: PublicKey,
     ) -> Result<Vec<u8>, crypto::DecryptionError> {
         let chain_key = self.get_or_create_receiver_key_chain(their_ratchet_key);
-        println!("receiving chain key: {:x?}", chain_key);
-        let message_keys = chain_key.message_keys();
+        let message_keys = self.get_or_create_message_keys(their_ratchet_key, chain_key, msg.idx);
+
         let plaintext = crypto::aes_256_cbc_decrypt(
-            ciphertext,
+            &msg.ciphertext,
             message_keys.cipher_key.as_ref(),
             &message_keys.iv,
         )?;
-        self.set_receiver_chain_key(their_ratchet_key, chain_key.next_chain_key());
+        // self.set_receiver_chain_key(their_ratchet_key, chain_key.next_chain_key());
         return Ok(plaintext);
     }
 
@@ -226,6 +235,62 @@ impl Ratchet {
             chain_key
         }
     }
+
+    fn get_or_create_message_keys(
+        &mut self,
+        their_ratchet_key: PublicKey,
+        mut chain_key: ChainKey,
+        counter: u32,
+    ) -> MessageKeys {
+        let current_idx = chain_key.index;
+        // out of order, it should have been saved in chain's message_keys_list
+        if current_idx > counter {
+            println!(
+                "out of order, using cached message keys, expect: {}, current: {}",
+                counter, current_idx
+            );
+            match self
+                .receiving_key_chains
+                .iter_mut()
+                .find(|(key, _)| key == &their_ratchet_key)
+            {
+                Some((_, chain)) => {
+                    return chain
+                        .message_keys_list
+                        .iter()
+                        .find(|keys| keys.index == counter)
+                        .unwrap()
+                        .clone();
+                }
+                None => unreachable!(""),
+            }
+        }
+
+        match self
+            .receiving_key_chains
+            .iter_mut()
+            .find(|(key, _)| key == &their_ratchet_key)
+        {
+            Some((_, chain)) => {
+                // let mut message_keys = chain_key.message_keys();
+                while chain_key.index != counter {
+                    let message_keys = chain_key.message_keys();
+                    println!("adding message keys of {}", chain_key.index);
+                    chain.message_keys_list.insert(0, message_keys);
+                    chain_key = chain_key.next_chain_key();
+                }
+                self.set_receiver_chain_key(their_ratchet_key, chain_key.next_chain_key());
+                return chain_key.message_keys();
+            }
+            None => unreachable!(""),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SignalMsg {
+    ciphertext: Vec<u8>,
+    idx: u32,
 }
 
 #[test]
@@ -235,17 +300,17 @@ fn test_ping_pong() {
 
     for _ in 0..10 {
         let plaintext = b"hello";
-        let ciphertext = alice_ratchet.encrypt(plaintext).unwrap();
+        let msg = alice_ratchet.encrypt(plaintext).unwrap();
 
         let decrypted = bob_ratchet
-            .decrypt(&ciphertext, alice_ratchet.get_ratchet_key())
+            .decrypt(msg, alice_ratchet.get_ratchet_key())
             .unwrap();
         assert!(decrypted == plaintext);
 
         let plaintext = b"world";
-        let ciphertext = bob_ratchet.encrypt(plaintext).unwrap();
+        let msg = bob_ratchet.encrypt(plaintext).unwrap();
         let decrypted = alice_ratchet
-            .decrypt(&ciphertext, bob_ratchet.get_ratchet_key())
+            .decrypt(msg, bob_ratchet.get_ratchet_key())
             .unwrap();
         assert!(decrypted == plaintext);
     }
@@ -260,10 +325,10 @@ fn test_ratchet_no_change() {
 
     for i in 0..10 {
         let plaintext = b"hello";
-        let ciphertext = alice_ratchet.encrypt(plaintext).unwrap();
+        let msg = alice_ratchet.encrypt(plaintext).unwrap();
 
         let decrypted = bob_ratchet
-            .decrypt(&ciphertext, alice_ratchet.get_ratchet_key())
+            .decrypt(msg, alice_ratchet.get_ratchet_key())
             .unwrap();
         // slice's ratchet key should not change during the encryption
         assert!(slice_ratchet_key == alice_ratchet.get_ratchet_key());
@@ -276,6 +341,32 @@ fn test_ratchet_no_change() {
         } else {
             assert!(bob_ratchet_key == bob_ratchet_key_after);
         }
+        assert!(decrypted == plaintext);
+    }
+}
+
+#[test]
+fn test_ratchet_out_of_order() {
+    let mut bob_ratchet = Ratchet::new_bob(&[]);
+    let mut alice_ratchet = Ratchet::new_slice(&[], bob_ratchet.get_ratchet_key());
+
+    let plaintext = b"hello";
+    let mut alice_ciphers = vec![];
+    for _ in 0..10 {
+        let ciphertext = alice_ratchet.encrypt(plaintext).unwrap();
+        alice_ciphers.push(ciphertext);
+    }
+
+    alice_ciphers.reverse();
+
+    for msg in &alice_ciphers {
+        println!("msg: {:?}", msg);
+    }
+
+    for msg in alice_ciphers {
+        let decrypted = bob_ratchet
+            .decrypt(msg, alice_ratchet.get_ratchet_key())
+            .unwrap();
         assert!(decrypted == plaintext);
     }
 }

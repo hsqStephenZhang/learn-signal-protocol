@@ -91,6 +91,8 @@ fn derive_keys_with_label(label: &[u8], secret_input: &[u8]) -> (RootKey, ChainK
     (root_key, chain_key)
 }
 
+// the above code was copied from https://github.com/signalapp/libsignal/blob/main/rust/crypto/src/aes_cbc.rs .etc
+
 pub fn generate_key_pair() -> (x25519_dalek::StaticSecret, x25519_dalek::PublicKey) {
     let private_key = x25519_dalek::StaticSecret::random();
     let public_key = x25519_dalek::PublicKey::from(&private_key);
